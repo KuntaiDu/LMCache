@@ -181,6 +181,42 @@ def lookup_all(
     return total
 
 
+def lookup_all_eventually(
+    client: MessageQueueClient,
+    keys: list[IPCCacheEngineKey],
+    expected: int,
+    timeout: float = DEFAULT_TIMEOUT,
+    poll_interval: float = 0.05,
+) -> int:
+    """Poll :func:`lookup_all` until it reports ``expected`` hits, or time out.
+
+    A key only becomes retrievable once the server's drain thread runs the
+    ``finish_write`` callback, which is asynchronous with respect to the store's
+    completion event (the client awaits a CUDA event recorded before the
+    callback is enqueued on the stream). A lookup issued immediately after a
+    store can therefore race ahead of ``finish_write`` and miss the key.
+    Production never does store-then-immediate-lookup, so this retry is a
+    test-side concern only.
+
+    Args:
+        client: The message queue client.
+        keys: Keys to look up.
+        expected: The hit count to wait for.
+        timeout: Maximum seconds to keep polling.
+        poll_interval: Seconds to sleep between polls.
+
+    Returns:
+        The most recent :func:`lookup_all` result -- ``expected`` once the
+        stores have drained, otherwise the last value seen before timing out.
+    """
+    deadline = time.monotonic() + timeout
+    found = lookup_all(client, keys)
+    while found != expected and time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        found = lookup_all(client, keys)
+    return found
+
+
 def store_keys(
     client: MessageQueueClient,
     keys: list[IPCCacheEngineKey],
@@ -439,8 +475,9 @@ def test_store_and_lookup(
     store_keys(client, keys, registered_instance, gpu_block_ids, event)
 
     # Lookup - keys that exist
-    lookup_result = lookup_all(client, keys)
-    assert lookup_result == num_keys, "All stored keys should exist"
+    assert lookup_all_eventually(client, keys, num_keys) == num_keys, (
+        "All stored keys should exist"
+    )
 
     # Lookup - keys that don't exist
     non_existent_keys = [create_cache_key(i + 1000) for i in range(5)]
@@ -473,8 +510,7 @@ def test_store_retrieve_verify(
     event.record()
 
     # Call look up to ensure the data is ready to be retrieved
-    lookup_result = lookup_all(client, keys)
-    assert lookup_result == num_keys
+    assert lookup_all_eventually(client, keys, num_keys) == num_keys
 
     # Retrieve to a different location in the cache
     # Use offset of 40 blocks (640 pages total needed: 320 + 320)
@@ -528,8 +564,7 @@ def test_retrieve_partial_miss(
     store_keys(client, stored_keys, registered_instance, store_block_ids, event)
 
     # Lookup to ensure keys are stored
-    lookup_result = lookup_all(client, stored_keys)
-    assert lookup_result == num_stored
+    assert lookup_all_eventually(client, stored_keys, num_stored) == num_stored
 
     # Try to retrieve 60 keys (only first 30 exist)
     # Total pages needed: 60 * 16 = 960 (< 1024)
@@ -556,8 +591,7 @@ def test_retrieve_partial_miss(
     )
 
     # Doing look up again to ensure data is ready
-    lookup_result_2 = lookup_all(client, stored_keys)
-    assert lookup_result_2 == num_stored
+    assert lookup_all_eventually(client, stored_keys, num_stored) == num_stored
 
     # Try to retrieve the first 30 keys only (all exist)
     retrieve_block_ids_2 = list(range(0, 16 * num_stored))
@@ -617,8 +651,10 @@ def test_multiple_retrieve_operations(
         for batch_idx in range(num_batches)
         for i in range(keys_per_batch)
     ]
-    lookup_result = lookup_all(client, all_keys)
-    assert lookup_result == num_batches * keys_per_batch, "All stored keys should exist"
+    expected = num_batches * keys_per_batch
+    assert lookup_all_eventually(client, all_keys, expected) == expected, (
+        "All stored keys should exist"
+    )
 
     # Retrieve in batches
     retrieve_offset = 32  # Start retrieving at offset of 32 chunks
@@ -685,8 +721,9 @@ def test_multiple_store_operations(
 
     # Verify all keys exist
     all_keys = keys1 + keys2
-    lookup_result = lookup_all(client, all_keys)
-    assert lookup_result == 50, "All stored keys from both batches should exist"
+    assert lookup_all_eventually(client, all_keys, 50) == 50, (
+        "All stored keys from both batches should exist"
+    )
 
 
 @pytest.mark.skipif(
